@@ -73,8 +73,8 @@ impl<T, const MAX_BLOCK_SIZE: usize> ReaderWriterQueue<T, MAX_BLOCK_SIZE> {
 
     pub fn from_other(other: &mut Self) -> Self {
         let item = Self {
-            front_block: AtomicPtr::new(other.front_block.load(Ordering::SeqCst)),
-            tail_block: AtomicPtr::new(other.tail_block.load(Ordering::SeqCst)),
+            front_block: AtomicPtr::new(other.front_block.load(Ordering::Relaxed)),
+            tail_block: AtomicPtr::new(other.tail_block.load(Ordering::Relaxed)),
             cacheline_filler: [0; CACHE_LINE_SIZE - size_of::<AtomicPtr<Block>>()],
             largest_block_size: other.largest_block_size,
             #[cfg(debug_assertions)]
@@ -93,8 +93,30 @@ impl<T, const MAX_BLOCK_SIZE: usize> ReaderWriterQueue<T, MAX_BLOCK_SIZE> {
         item
     }
 
-    fn try_dequeue<U>(&mut self, result: &U) -> bool {
-        true
+    pub fn try_dequeue(&mut self) -> Option<T> {
+        let front_block = self.front_block.load(Ordering::Relaxed);
+        let block_tail = unsafe { (*front_block).local_tail };
+        let block_front = unsafe { (*front_block).front.load(Ordering::Relaxed) };
+        if block_front != block_tail
+            || block_front
+                != unsafe {
+                    (*front_block).local_tail = (*front_block).tail.load(Ordering::Relaxed);
+                    (*front_block).local_tail
+                }
+        {
+            fence(Ordering::Acquire);
+
+            let element =
+                unsafe { (*front_block).data.add(block_front * size_of::<T>()) as *mut T };
+            // return Some(unsafe { *element });
+        } else if front_block != self.tail_block.load(Ordering::Relaxed) {
+            let element =
+                unsafe { (*front_block).data.add(block_front * size_of::<T>()) as *mut T };
+            // return Some(unsafe { *element });
+        } else {
+            return None;
+        }
+        None
     }
 
     fn make_block(capacity: usize) -> *mut Block {
@@ -112,12 +134,12 @@ impl<T, const MAX_BLOCK_SIZE: usize> ReaderWriterQueue<T, MAX_BLOCK_SIZE> {
 impl<T, const MAX_BLOCK_SIZE: usize> Drop for ReaderWriterQueue<T, MAX_BLOCK_SIZE> {
     fn drop(&mut self) {
         fence(Ordering::SeqCst);
-        let front_block = self.front_block.load(Ordering::SeqCst);
+        let front_block = self.front_block.load(Ordering::Relaxed);
         let mut block = front_block.clone();
         loop {
-            let next_block = unsafe { (*block).next.load(Ordering::SeqCst) };
-            let block_front = unsafe { (*block).front.load(Ordering::SeqCst) };
-            let block_tail = unsafe { (*block).tail.load(Ordering::SeqCst) };
+            let next_block = unsafe { (*block).next.load(Ordering::Relaxed) };
+            let block_front = unsafe { (*block).front.load(Ordering::Relaxed) };
+            let block_tail = unsafe { (*block).tail.load(Ordering::Relaxed) };
             let mut i = block_front;
             while i != block_tail {
                 let element = unsafe { (*block).data.add(i * size_of::<T>()) as *mut T };
