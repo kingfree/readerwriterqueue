@@ -43,6 +43,9 @@ pub struct ReaderWriterQueue<T, const MAX_BLOCK_SIZE: usize = 512> {
     _phantom: PhantomData<T>,
 }
 
+unsafe impl<T: Send> Sync for ReaderWriterQueue<T> {}
+unsafe impl<T: Send> Send for ReaderWriterQueue<T> {}
+
 impl<T, const MAX_BLOCK_SIZE: usize> ReaderWriterQueue<T, MAX_BLOCK_SIZE> {
     pub fn new() -> Self {
         Self::with_size(15)
@@ -50,13 +53,13 @@ impl<T, const MAX_BLOCK_SIZE: usize> ReaderWriterQueue<T, MAX_BLOCK_SIZE> {
 
     pub fn with_size(size: usize) -> Self {
         assert!(
-            MAX_BLOCK_SIZE == ceilToPow2(MAX_BLOCK_SIZE),
+            MAX_BLOCK_SIZE == ceil_to_pow2(MAX_BLOCK_SIZE),
             "MAX_BLOCK_SIZE must be a power of 2"
         );
         assert!(MAX_BLOCK_SIZE >= 2, "MAX_BLOCK_SIZE must be at least 2");
 
         let mut first_block: *mut Block = null_mut();
-        let mut largest_block_size = ceilToPow2(size + 1); // We need a spare slot to fit size elements in the block
+        let mut largest_block_size = ceil_to_pow2(size + 1); // We need a spare slot to fit size elements in the block
         if largest_block_size > MAX_BLOCK_SIZE * 2 {
             // We need a spare block in case the producer is writing to a different block the consumer is reading from, and
             // wants to enqueue the maximum number of elements. We also need a spare element in each block to avoid the ambiguity
@@ -116,7 +119,15 @@ impl<T, const MAX_BLOCK_SIZE: usize> ReaderWriterQueue<T, MAX_BLOCK_SIZE> {
         item
     }
 
-    pub fn try_dequeue(&mut self) -> Option<T> {
+    pub fn try_enqueue(&self, element: T) -> bool {
+        self.inner_enqueue(element, false)
+    }
+
+    pub fn enqueue(&self, element: T) -> bool {
+        self.inner_enqueue(element, true)
+    }
+
+    pub fn try_dequeue(&self) -> Option<T> {
         let front_block_ = self.front_block.load(Ordering::Relaxed);
         let front_block = unsafe { front_block_.as_mut().unwrap() };
         let block_tail = front_block.local_tail;
@@ -246,6 +257,55 @@ impl<T, const MAX_BLOCK_SIZE: usize> ReaderWriterQueue<T, MAX_BLOCK_SIZE> {
         None
     }
 
+    fn pop(&self) -> bool {
+        #[cfg(debug_assertions)]
+        let _guard = ReentrantGuard::new(&self.dequeuing);
+
+        true
+    }
+
+    #[inline]
+    pub fn size_approx(&self) -> usize {
+        let mut result = 0;
+        let front_block = self.front_block.load(Ordering::Relaxed);
+        let mut block = front_block;
+        loop {
+            fence(Ordering::Acquire);
+            let block_front = unsafe { (*block).front.load(Ordering::Relaxed) };
+            let block_tail = unsafe { (*block).tail.load(Ordering::Relaxed) };
+            result += (block_tail - block_front) & unsafe { (*block).size_mask };
+            block = unsafe { (*block).next.load(Ordering::Relaxed) };
+            if block == front_block {
+                break;
+            }
+        }
+        result
+    }
+
+    #[inline]
+    pub fn max_capacity(&self) -> usize {
+        let mut result = 0;
+        let front_block = self.front_block.load(Ordering::Relaxed);
+        let mut block = front_block;
+        loop {
+            fence(Ordering::Acquire);
+            result += unsafe { (*block).size_mask };
+            block = unsafe { (*block).next.load(Ordering::Relaxed) };
+            if block == front_block {
+                break;
+            }
+        }
+        result
+    }
+
+    fn inner_enqueue(&self, element: T, can_alloc: bool) -> bool {
+        #[cfg(debug_assertions)]
+        let _guard = ReentrantGuard::new(&self.enqueuing);
+
+
+        true
+    }
+
     fn make_block(capacity: usize) -> *mut Block {
         let mut size = size_of::<Block>() + align_of::<Block>() - 1;
         size += size_of::<T>() + align_of::<T>() - 1;
@@ -324,7 +384,7 @@ unsafe fn align_for<U>(ptr: *mut u8) -> *mut u8 {
     ptr.add(alignment)
 }
 
-fn ceilToPow2(x: usize) -> usize {
+fn ceil_to_pow2(x: usize) -> usize {
     let mut x = x;
     // From http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
     x -= 1;
